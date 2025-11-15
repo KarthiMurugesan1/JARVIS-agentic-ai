@@ -7,3 +7,5 @@ POSTGRES_CONFIG = {
     "host": "localhost",
     "port": 5432
 }
+
+STM_CONDENSE_THRESHOLD = 5
