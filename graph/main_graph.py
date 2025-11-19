@@ -1,6 +1,10 @@
 # graph/main_graph.py
+import os # NEW: Required to read the DATABASE_URL from environment variables
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+# OLD: from langgraph.checkpoint.memory import MemorySaver
+from langgraph_checkpoint_sqlite import SqliteSaver # <-- CORRECT: This is the class for SQL persistence
+from typing import TypedDict, Annotated, Sequence
+import operator
 from typing import TypedDict, Annotated, Sequence
 import operator
 import json
@@ -201,5 +205,14 @@ graph_builder.add_conditional_edges(
 graph_builder.add_edge("tool_executor", "planner_llm")
 graph_builder.add_edge("respond", END)
 
-memory = MemorySaver()
+# --- START OF POSTGRES PERSISTENCE SETUP ---
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if not DATABASE_URL:
+    # This check ensures the app won't start without the critical DB URL
+    raise ValueError("DATABASE_URL environment variable is required for LangGraph persistence. Please configure it on Render.")
+
+# **SqliteSaver** accepts the **PostgreSQL URL** from Render and uses it for persistence.
+memory = SqliteSaver.from_conn_string(conn_str=DATABASE_URL)
+
 graph = graph_builder.compile(checkpointer=memory)
