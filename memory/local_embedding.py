@@ -6,7 +6,7 @@ from pydantic import PrivateAttr
 # Create one global model instance
 _embed_model_instance = HuggingFaceEmbedding(
     model_name="sentence-transformers/all-MiniLM-L6-v2",
-    device="mps"
+    device="cpu"
 )
 print("Loading local embedding model: sentence-transformers/all-MiniLM-L6-v2")
 
