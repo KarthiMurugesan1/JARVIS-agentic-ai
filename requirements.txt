@@ -109,6 +109,8 @@ grpcio==1.76.0
     #   grpcio-status
 grpcio-status==1.71.2
     # via google-api-core
+gunicorn==23.0.0
+    # via jarvis-agentic-ai (pyproject.toml)
 h11==0.16.0
     # via
     #   httpcore
@@ -225,6 +227,7 @@ ormsgpack==1.12.0
 packaging==25.0
     # via
     #   jarvis-agentic-ai (pyproject.toml)
+    #   gunicorn
     #   huggingface-hub
     #   langchain-core
     #   langsmith
