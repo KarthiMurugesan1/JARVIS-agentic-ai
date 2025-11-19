@@ -1,190 +1,211 @@
 # graph/main_graph.py
-import os # NEW: Required to read the DATABASE_URL from environment variables
-from langgraph.graph import StateGraph, END
-# OLD: from langgraph.checkpoint.memory import MemorySaver
-from langgraph_checkpoint_sqlite import SqliteSaver # <-- CORRECT: This is the class for SQL persistence
-from typing import TypedDict, Annotated, Sequence
-import operator
-from typing import TypedDict, Annotated, Sequence
-import operator
+
+import os
 import json
 import re
-from perception.perplexity_api import perplexity_search
+import operator
+from typing import TypedDict, Annotated, Sequence
 
-# We will use LangChain's message types to store history
+from dotenv import load_dotenv
+load_dotenv()
+
+# LangGraph
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+# LangChain messages
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 
-# ---- Imports for reasoning, memory, and TOOLS ---- #
+# Internal modules
+from perception.perplexity_api import perplexity_search
 from reasoning.llm_reasoning import llm_reasoning_with_history
 from memory.short_term_memory import update_short_term_memory
 from memory.local_embedding import get_embedding
 from tools.tool_registry import AVAILABLE_TOOLS, TOOL_DESCRIPTIONS
+from utils.config import POSTGRES_CONFIG
 
-# ---- 1. Define the State Schema ---- #
+
+# ============================================================
+# =============== LOAD ENVIRONMENT VARIABLES =================
+# ============================================================
+
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+STM_CONDENSE_THRESHOLD = int(os.getenv("STM_CONDENSE_THRESHOLD", 5))
+
+
+# ============================================================
+# ===== DATABASE_URL HANDLING (LOCAL + RENDER COMPATIBLE) =====
+# ============================================================
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL or DATABASE_URL.strip() == "":
+    print("⚠️ DATABASE_URL not set. Using local PostgreSQL from .env ...")
+
+    DATABASE_URL = (
+        f"postgresql://{POSTGRES_CONFIG['user']}:{POSTGRES_CONFIG['password']}@"
+        f"{POSTGRES_CONFIG['host']}:{POSTGRES_CONFIG['port']}/"
+        f"{POSTGRES_CONFIG['dbname']}"
+    )
+
+    print(f"✔️ Local DATABASE_URL = {DATABASE_URL}")
+
+
+# ============================================================
+# ======================= AGENT STATE =========================
+# ============================================================
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
 
-# ---- 2. Define the Nodes ---- #
+
+# ============================================================
+# ===================== PLANNER NODE =========================
+# ============================================================
 
 def call_planner_llm(state: AgentState):
-    """
-    This is the "brain." It looks at the conversation history and
-    decides what to do next: call a tool or respond to the user.
-    """
     print("🤖 [Node] Planner LLM is thinking...")
-    messages = state['messages']
-    
-    # --- THIS IS THE UPGRADED, CLEARER PROMPT ---
+    messages = state["messages"]
+
     system_prompt = f"""
-You are JARVIS, a proactive and personalized AI assistant.
-Your job is to analyze the conversation and the result of any tool calls, then decide on the next logical step.
-You have access to the following tools:
+You are JARVIS, a proactive, highly capable AI assistant.
+
+You have access to these tools:
 {TOOL_DESCRIPTIONS}
 
-**Your Core Principles (In Order):**
-
-1.  **Analyze the Last Message:**
-    * **If the last message is a `ToolMessage` (a result from a tool):** Your *only* job is to synthesize this new information into a clear, natural language answer for the user.
-    * **If the last message is a `HumanMessage` (a new query):** You must decide what to do.
-
-2.  **How to Decide on a Plan (for Human Messages):**
-    * **Personal Memory:** For questions about the user (e.g., "what's my name?") or saving new facts (e.g., "my name is..."), use the `retrieve_memory` or `save_memory` tools.
-    * **System Actions:** For requests to find/open files, play music, or check system stats, use the appropriate tool (`find_file`, `open_path`, `play_song_on_youtube`, `get_system_stats`).
-    * **General Knowledge:** For *any* other question about the world, facts, news, or people (e.g., "who is ceo of tata"), you *must* use the `search_web` tool.
-    * **Simple Chat:** For simple greetings or chat (e.g., "hello", "how are you"), just respond naturally.
-
-3.  **Re-planning Logic:**
-    * If `open_path` fails, your next step *must* be `find_file`.
-    * If `find_file` succeeds, your next step *must* be `open_path` with the new path.
-    * If `find_file` fails, you *must* stop and report the failure to the user.
-
-4.  **Final Output:**
-    * If your plan is to use a tool, return *only* the JSON for that tool call.
-    * If your plan is to respond to the user, return *only* that natural language response.
-
-**Tool Call JSON Format:**
-{{
-    "tool_name": "name_of_the_tool",
-    "parameters": {{"arg_name": "arg_value"}}
-}}
+Rules:
+1. If last message is a ToolMessage → summarize result for user.
+2. If HumanMessage:
+   - Use memory tools for personal info.
+   - Use system tools for system actions.
+   - Use search_web for general knowledge.
+   - Otherwise answer normally.
+3. If planning to use a tool → output ONLY JSON tool call.
+4. Otherwise → output ONLY the answer.
 """
-    # --- END OF PROMPT UPGRADE ---
-    
+
     llm_response = llm_reasoning_with_history(system_prompt, messages)
-    
+
     try:
-        match = re.search(r'\{.*\}', llm_response, re.DOTALL)
+        match = re.search(r"\{.*\}", llm_response, re.DOTALL)
+
         if match:
             tool_call_json = json.loads(match.group())
             tool_name = tool_call_json.get("tool_name")
             parameters = tool_call_json.get("parameters", {})
-            
-            print(f"🤖 [Node] Planner wants to call tool: {tool_name}")
-            new_ai_message = AIMessage(
-                content="",
-                tool_calls=[{
-                    "id": f"tool_{len(messages)}",
-                    "name": tool_name,
-                    "args": parameters
-                }]
-            )
+
+            print(f"🤖 [Planner] Calling tool: {tool_name}")
+
+            return {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[{
+                            "id": f"tool_{len(messages)}",
+                            "name": tool_name,
+                            "args": parameters
+                        }]
+                    )
+                ]
+            }
         else:
-            print("🤖 [Node] Planner is responding directly.")
-            new_ai_message = AIMessage(content=llm_response)
-    
+            print("🤖 [Planner] Responding directly.")
+            return {"messages": [AIMessage(content=llm_response)]}
+
     except Exception as e:
-        print(f"Error in planner: {e}. LLM response was: {llm_response}")
-        new_ai_message = AIMessage(content="Sorry, I got confused. Please try again.")
+        print(f"Planner error: {e}, LLM said: {llm_response}")
+        return {"messages": [AIMessage(content="I got confused. Please try again.")]}
 
-    return {"messages": [new_ai_message]}
 
+# ============================================================
+# ==================== TOOL EXECUTOR NODE ====================
+# ============================================================
 
 def call_tool_executor(state: AgentState):
-    """
-    This node executes the tool call requested by the planner LLM.
-    """
     print("🤖 [Node] Tool Executor")
-    last_message = state['messages'][-1]
-    
-    tool_call = last_message.tool_calls[0]
-    tool_name = tool_call["name"]
-    parameters = tool_call["args"]
-    
-    if tool_name in AVAILABLE_TOOLS:
-        tool_function = AVAILABLE_TOOLS[tool_name]
-        try:
-            tool_result = tool_function(**parameters)
-            tool_result_str = str(tool_result)
-            print(f"🤖 [Node] Tool '{tool_name}' succeeded.")
-        except Exception as e:
-            tool_result_str = f"Error running tool: {e}"
-            print(f"Error calling tool {tool_name}: {e}")
-    else:
-        tool_result_str = f"Error: Tool '{tool_name}' does not exist."
 
-    return {"messages": [ToolMessage(content=tool_result_str, tool_call_id=tool_call["id"])]}
+    last = state["messages"][-1]
+    tool_call = last.tool_calls[0]
 
+    name = tool_call["name"]
+    args = tool_call["args"]
+
+    if name not in AVAILABLE_TOOLS:
+        return {
+            "messages": [
+                ToolMessage(content=f"Error: Tool '{name}' not found.", tool_call_id=tool_call["id"])
+            ]
+        }
+
+    try:
+        result = AVAILABLE_TOOLS[name](**args)
+        print(f"🤖 [Tool Executor] {name} succeeded")
+        return {
+            "messages": [
+                ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+            ]
+        }
+    except Exception as e:
+        print(f"Error running tool {name}: {e}")
+        return {
+            "messages": [
+                ToolMessage(content=f"Error running tool: {e}", tool_call_id=tool_call["id"])
+            ]
+        }
+
+
+# ============================================================
+# =================== FINAL RESPONSE NODE ====================
+# ============================================================
 
 def respond_and_save_node(state: AgentState):
-    """
-    This node prints the final response and *conditionally* saves it to STM.
-    """
-    final_response = state['messages'][-1].content
+    final_response = state["messages"][-1].content
     print("🤖 JARVIS:", final_response)
-    
-    # --- Find the last user query ---
+
+    # find last user message
     user_query = ""
-    for msg in reversed(state['messages']):
-        if isinstance(msg, HumanMessage):
-            user_query = msg.content
+    for m in reversed(state["messages"]):
+        if isinstance(m, HumanMessage):
+            user_query = m.content
             break
-            
-    summary = f"User: \"{user_query}\" | JARVIS: \"{final_response}\""
 
-    # --- New STM Decision Logic ---
-    # We ask the LLM if this summary is worth saving
+    summary = f'User: "{user_query}" | JARVIS: "{final_response}"'
+
     decision_prompt = f"""
-You are a memory filter. A conversation just ended.
-Summary: "{summary}"
+Memory filter:
+"{summary}"
 
-Is this exchange trivial (e.g., "hi", "how are you", "thanks", "ok", "you're welcome")?
-Or does it contain new information, a question, a plan, or a meaningful interaction?
-
-Answer with a single word: 'SAVE' or 'IGNORE'.
+Return ONLY: SAVE or IGNORE.
 """
-    
-    try:
-        # We use the raw perplexity_search for a simple, non-history call
-        decision = perplexity_search(decision_prompt).strip().upper()
-    except Exception as e:
-        print(f"[STM] Error during decision: {e}")
-        decision = "SAVE" # Default to saving if decision fails
 
-    if "SAVE" in decision:
+    try:
+        decision = perplexity_search(decision_prompt).strip().upper()
+    except:
+        decision = "SAVE"
+
+    if decision == "SAVE":
         embedding = get_embedding(summary)
         update_short_term_memory(summary, embedding)
-        print(f"[STM] Stored: {summary}")
+        print(f"[STM] Saved: {summary}")
     else:
-        # This is what you wanted
-        print(f"[STM] Ignored trivial exchange.")
-    # --- End of New Logic ---
-    
+        print("[STM] Ignored trivial exchange.")
+
     return state
 
-# ---- 3. Define the Graph Edges (The Router) ---- #
+
+# ============================================================
+# ======================== ROUTER =============================
+# ============================================================
 
 def should_continue(state: AgentState):
-    """
-    This is the "router" that creates the loop.
-    """
-    last_message = state['messages'][-1]
-    
-    if last_message.tool_calls:
-        return "call_tool"
-    else:
-        return "end"
+    last = state["messages"][-1]
+    return "call_tool" if last.tool_calls else "end"
 
-# ---- 4. Build the Graph ---- #
+
+# ============================================================
+# ======================= BUILD GRAPH =========================
+# ============================================================
+
 graph_builder = StateGraph(AgentState)
 
 graph_builder.add_node("planner_llm", call_planner_llm)
@@ -198,21 +219,19 @@ graph_builder.add_conditional_edges(
     should_continue,
     {
         "call_tool": "tool_executor",
-        "end": "respond",
-    },
+        "end": "respond"
+    }
 )
 
 graph_builder.add_edge("tool_executor", "planner_llm")
 graph_builder.add_edge("respond", END)
 
-# --- START OF POSTGRES PERSISTENCE SETUP ---
-DATABASE_URL = os.environ.get("DATABASE_URL")
 
-if not DATABASE_URL:
-    # This check ensures the app won't start without the critical DB URL
-    raise ValueError("DATABASE_URL environment variable is required for LangGraph persistence. Please configure it on Render.")
+# ============================================================
+# =============== CHECKPOINT (POSTGRES + SQLITE) ==============
+# ============================================================
 
-# **SqliteSaver** accepts the **PostgreSQL URL** from Render and uses it for persistence.
-memory = SqliteSaver.from_conn_string(conn_str=DATABASE_URL)
+# IMPORTANT: langgraph-checkpoint-sqlite v3.x uses new signature.
+memory = SqliteSaver.from_conn_string(DATABASE_URL)
 
 graph = graph_builder.compile(checkpointer=memory)
